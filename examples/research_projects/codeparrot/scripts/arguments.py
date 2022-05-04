@@ -28,13 +28,19 @@ class TrainingArguments:
     shuffle_buffer: Optional[int] = field(
         default=1000, metadata={"help": "Size of buffer used to shuffle streaming dataset."}
     )
+    batch_shuffle_buffer: Optional[int] = field(
+        default=10000, metadata={"help": "Size of buffer used to shuffle streaming dataset."}
+    )
+    shuffle_batch: Optional[bool] = field(
+        default=True, metadata={"help": "If True shuffles inside batches of the dataset."}
+    )
     learning_rate: Optional[float] = field(default=2e-4, metadata={"help": "Learning rate fo training."})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "Learning rate."})
     num_warmup_steps: Optional[int] = field(
         default=750, metadata={"help": "Number of warmup steps in the learning rate schedule."}
     )
     gradient_accumulation_steps: Optional[int] = field(
-        default=16, metadata={"help": "Number of gradient accumulation steps."}
+        default=16*8, metadata={"help": "Number of gradient accumulation steps."}
     )
     gradient_checkpointing: Optional[bool] = field(
         default=True, metadata={"help": "Use gradient checkpointing to reduce memory footprint."}
@@ -53,7 +59,15 @@ class TrainingArguments:
         default=None,
         metadata={"help": "States path if the training should continue from a checkpoint folder."},
     )
-
+    tokenized: Optional[bool] = field(
+        default=False, metadata={"help": "If True the data is pretokenized."}
+    )
+    use_bnb_optimizer: Optional[bool] = field(
+        default=False, metadata={"help": "If True use bnb optimizer."}
+    )
+    use_apex_optimizer: Optional[bool] = field(
+        default=False, metadata={"help": "If True use apex optimizer."}
+    )
 
 @dataclass
 class EvaluationArguments:
@@ -130,7 +144,7 @@ class PreprocessingArguments:
         },
     )
     dataset_name: Optional[str] = field(
-        default="codeparrot", metadata={"help": "Folder or name of dataset to process."}
+        default="transformersbook/codeparrot", metadata={"help": "Folder or name of dataset to process."}
     )
     output_dir: Optional[str] = field(
         default="codeparrot-clean", metadata={"help": "Folder to save processed processed dataset."}
@@ -148,7 +162,16 @@ class PreprocessingArguments:
     alpha_frac: Optional[float] = field(
         default=0.25, metadata={"help": "Maximum fraction of non-alphanumeric characters, otherwise file is filtered."}
     )
-
+    min_token_ratio: Optional[float] = field(
+        default=1.5, metadata={"help": "Minimum character token ratio for the file, otherwise file is filtered."}
+    )
+    filter_proba: Optional[float] = field(
+        default=0.7, metadata={"help": "Probability for filtering config, test and uncommon files."}
+    )
+    tokenizer_dir: Optional[str] = field(
+        default="lvwerra/codeparrot",
+        metadata={"help": "Name or path to the tokenizer."},
+    )    
 
 @dataclass
 class TokenizerTrainingArguments:
@@ -171,6 +194,21 @@ class TokenizerTrainingArguments:
     tokenizer_name: Optional[str] = field(default="codeparrot", metadata={"help": "Name of new tokenizer."})
     push_to_hub: Optional[bool] = field(default=True, metadata={"help": "Push saved tokenizer to the hub."})
 
+
+@dataclass
+class PretokenizationArguments:
+    """
+    Configuration for data pretokenization.
+    """
+    tokenizer_dir: Optional[str] = field(
+        default="lvwerra/codeparrot",
+        metadata={"help": "Name or path to the tokenizer."},
+    )
+    dataset_name: Optional[str] = field(
+        default="lvwerra/codeparrot-clean-train", metadata={"help": "Name or path to the dataset to pretokenize."}
+    )
+    tokenized_data_repo: Optional[str] = field(default="lvwerra/tokenized-codeparrot-train", metadata={"help": "Repo name of the pretokenized data."})
+    num_workers: Optional[int] = field(default=None, metadata={"help": "Number of workers used for code evaluation."})
 
 @dataclass
 class InitializationArguments:
