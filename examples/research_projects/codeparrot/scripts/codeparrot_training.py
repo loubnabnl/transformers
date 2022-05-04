@@ -3,19 +3,20 @@ import os
 import time
 from argparse import Namespace
 from pathlib import Path
+import random
 
 import datasets
 import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset
 from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.datapipes.iter import combinatorics 
 
 import transformers
 from accelerate import Accelerator, DistributedType
 from arguments import TrainingArguments
 from huggingface_hub import Repository
 from transformers import AdamW, AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, get_scheduler, set_seed
-
 
 class ConstantLengthDataset(IterableDataset):
     """
@@ -27,19 +28,26 @@ class ConstantLengthDataset(IterableDataset):
             seq_length (int): Length of token sequences to return.
             num_of_sequences: Number of token sequences to keep in buffer.
             chars_per_token: Number of characters per token used to estimate number of tokens in text buffer.
+            tokenized: If true we use a pretokenized dataset.
     """
-
     def __init__(
-        self, tokenizer, dataset, infinite=False, seq_length=1024, num_of_sequences=1024, chars_per_token=3.6
+        self, tokenizer, dataset, infinite=False, seq_length=1024, num_of_sequences=1024, chars_per_token=3.6, tokenized=False
     ):
         self.tokenizer = tokenizer
         self.concat_token_id = tokenizer.bos_token_id
         self.dataset = dataset
         self.seq_length = seq_length
-        self.input_characters = seq_length * chars_per_token * num_of_sequences
         self.epoch = 0
         self.infinite = infinite
         self.current_size = 0
+        self.tokenized = tokenized
+        
+        if self.tokenized:
+            self.max_buffer_size = seq_length * num_of_sequences
+            self.content_field = "input_ids"
+        else:
+            self.max_buffer_size = seq_length * chars_per_token * num_of_sequences
+            self.content_field = "content"
 
     def __iter__(self):
         iterator = iter(self.dataset)
@@ -47,10 +55,10 @@ class ConstantLengthDataset(IterableDataset):
         while more_examples:
             buffer, buffer_len = [], 0
             while True:
-                if buffer_len >= self.input_characters:
+                if buffer_len >= self.max_buffer_size:
                     break
                 try:
-                    buffer.append(next(iterator)["content"])
+                    buffer.append(next(iterator)[self.content_field])
                     buffer_len += len(buffer[-1])
                 except StopIteration:
                     if self.infinite:
@@ -60,7 +68,10 @@ class ConstantLengthDataset(IterableDataset):
                     else:
                         more_examples = False
                         break
-            tokenized_inputs = self.tokenizer(buffer, truncation=False)["input_ids"]
+            if self.tokenized:
+                tokenized_inputs = buffer
+            else:
+                tokenized_inputs = self.tokenizer(buffer, truncation=False)["input_ids"]
             all_token_ids = []
             for tokenized_input in tokenized_inputs:
                 all_token_ids.extend(tokenized_input + [self.concat_token_id])
@@ -69,8 +80,45 @@ class ConstantLengthDataset(IterableDataset):
                 if len(input_ids) == self.seq_length:
                     self.current_size += 1
                     yield torch.tensor(input_ids)
+                    
+    #def shuffle(self, buffer_size=1000):
+    #    return combinatorics.ShufflerIterDataPipe(self, buffer_size=buffer_size)
+    
 
-
+class ShuffleDataset(IterableDataset):
+    """
+    Shuffled version of ConstantLengthDataset.
+        Args:
+            dataset (ConstantLengthDataset): Iterable Dataset.
+            buffer_size (bool): buffer size for shuffling.
+    """
+    def __init__(self, dataset, buffer_size):
+        super().__init__()
+        self.dataset = dataset
+        self.buffer_size = buffer_size
+        
+    def __iter__(self):
+        shuffle_buffer = []
+        try:
+            dataset_iter = iter(self.dataset)
+            for i in range(self.buffer_size):
+                shuffle_buffer.append(next(dataset_iter))
+        except:
+            self.buffer_size = len(shuffle_buffer)
+        try:
+            while True:
+                try:
+                    item = next(dataset_iter)
+                    evict_idx = random.randint(0, self.buffer_size - 1)
+                    yield shuffle_buffer[evict_idx]
+                    shuffle_buffer[evict_idx] = item
+                except StopIteration:
+                    break
+            while len(shuffle_buffer) > 0:
+                yield shuffle_buffer.pop()
+        except GeneratorExit:
+              pass
+            
 def setup_logging(args):
     project_name = args.model_ckpt.split("/")[-1]
     logger = logging.getLogger(__name__)
@@ -102,8 +150,11 @@ def create_dataloaders(args):
     train_data = load_dataset(args.dataset_name_train, split="train", **ds_kwargs)
     train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     valid_data = load_dataset(args.dataset_name_valid, split="train", **ds_kwargs)
-    train_dataset = ConstantLengthDataset(tokenizer, train_data, infinite=True, seq_length=args.seq_length)
-    valid_dataset = ConstantLengthDataset(tokenizer, valid_data, infinite=False, seq_length=args.seq_length)
+    train_dataset = ConstantLengthDataset(tokenizer, train_data, infinite=True, seq_length=args.seq_length, tokenized=args.tokenized)
+    valid_dataset = ConstantLengthDataset(tokenizer, valid_data, infinite=False, seq_length=args.seq_length, tokenized=args.tokenized)
+    if args.shuffle_batch:
+        #train_dataset = train_dataset.shuffle(buffer_size=args.batch_shuffle_buffer)
+        train_dataset = ShuffleDataset(train_dataset, buffer_size=args.batch_shuffle_buffer)
     train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size)
     eval_dataloader = DataLoader(valid_dataset, batch_size=args.valid_batch_size)
     return train_dataloader, eval_dataloader
@@ -163,7 +214,7 @@ def evaluate(args):
 
 
 # Accelerator
-accelerator = Accelerator(log_with=["wandb", "tensorboard"])
+accelerator = Accelerator(log_with=["wandb", "tensorboard"], logging_dir='./logs')
 acc_state = {str(k): str(v) for k, v in accelerator.state.__dict__.items()}
 
 # Settings
@@ -175,27 +226,26 @@ samples_per_step = accelerator.state.num_processes * args.train_batch_size
 set_seed(args.seed)
 
 # Clone model repository
-if accelerator.is_main_process:
-    hf_repo = Repository(args.save_dir, clone_from=args.model_ckpt)
+#if accelerator.is_main_process:
+    #hf_repo = Repository(args.save_dir, clone_from=args.model_ckpt)
 
 # Logging
 logger, run_name = setup_logging(args)
 logger.info(accelerator.state)
 
 # Checkout new branch on repo
-if accelerator.is_main_process:
-    hf_repo.git_checkout(run_name, create_branch_ok=True)
+#if accelerator.is_main_process:
+    #hf_repo.git_checkout(run_name, create_branch_ok=True)
 
 # Load model and tokenizer
-model = AutoModelForCausalLM.from_pretrained(args.save_dir)
+model = AutoModelForCausalLM.from_pretrained(args.model_ckpt)
 if args.gradient_checkpointing:
     model.gradient_checkpointing_enable()
-tokenizer = AutoTokenizer.from_pretrained(args.save_dir)
+tokenizer = AutoTokenizer.from_pretrained(args.model_ckpt)
 
 # Load dataset and dataloader
 train_dataloader, eval_dataloader = create_dataloaders(args)
 
-# Prepare the optimizer and learning rate scheduler
 optimizer = AdamW(get_grouped_params(model, args), lr=args.learning_rate)
 lr_scheduler = get_scheduler(
     name=args.lr_scheduler_type,
@@ -238,8 +288,10 @@ for step, batch in enumerate(train_dataloader, start=1):
     if args.resume_from_checkpoint and step < resume_step:
         continue  # we need to skip steps until we reach the resumed step
     loss = model(batch, labels=batch, use_cache=False).loss
+    loss_tracking = loss.repeat(args.train_batch_size)
+    loss_tracking = accelerator.gather(loss_tracking).mean()
     log_metrics(
-        step, {"lr": get_lr(), "samples": step * samples_per_step, "steps": completed_steps, "loss/train": loss.item()}
+        step, {"lr": get_lr(), "samples": step * samples_per_step, "steps": completed_steps, "loss/train": loss_tracking.item()}
     )
     loss = loss / args.gradient_accumulation_steps
     if step % args.gradient_accumulation_steps != 0:
@@ -267,8 +319,8 @@ for step, batch in enumerate(train_dataloader, start=1):
         accelerator.wait_for_everyone()
         save_dir = os.path.join(args.save_dir, f"step_{step}")
         accelerator.save_state(save_dir)
-        if accelerator.is_main_process:
-            hf_repo.push_to_hub(commit_message=f"step {step}")
+        #if accelerator.is_main_process:
+            #hf_repo.push_to_hub(commit_message=f"step {step}")
         model.train()
     if completed_steps >= args.max_train_steps:
         break
@@ -282,5 +334,5 @@ unwrapped_model = accelerator.unwrap_model(model)
 unwrapped_model.save_pretrained(args.save_dir, save_function=accelerator.save)
 save_dir = os.path.join(args.save_dir, f"step_{step}")
 accelerator.save_state(save_dir)
-if accelerator.is_main_process:
-    hf_repo.push_to_hub(commit_message="final model")
+#if accelerator.is_main_process:
+#    hf_repo.push_to_hub(commit_message="final model")
